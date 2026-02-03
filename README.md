@@ -410,6 +410,7 @@ MIT License
 
 ## 🙏 致谢
 
+- [catslovefish1/catgpt](https://github.com/catslovefish1/catgpt) - 本项目灵感来源
 - [HuggingFace Transformers](https://github.com/huggingface/transformers)
 - [pleisto/wikipedia-cn-20230720-filtered](https://huggingface.co/datasets/pleisto/wikipedia-cn-20230720-filtered)
 - [wangrui6/Zhihu-KOL](https://huggingface.co/datasets/wangrui6/Zhihu-KOL)
