@@ -299,3 +299,230 @@ python -c "import torch; print(torch.cuda.get_device_capability())"
 ---
 
 *最后更新: 2026-02-03*
+
+---
+
+## 🔴 新增严重问题 (2026-02-03 训练补充)
+
+### 15. GenerationCallback 中 datetime 未导入
+
+**报错信息**:
+```
+NameError: name 'datetime' is not defined. Did you forget to import 'datetime'?
+```
+
+**原因**: 在 callback 类中使用 `datetime.now()` 但忘记在脚本顶部导入
+
+**解决方案**:
+```python
+# 在脚本顶部添加
+from datetime import datetime
+```
+
+---
+
+### 16. Tokenizer 词表大小错误 (unk_id 问题) - "Final Boss"
+
+**报错信息**:
+```
+ValueError: unk_id 0 is out of range (vocab_size = 3)
+# 或
+RuntimeError: Vocabulary size mismatch: config=32000, actual=3
+```
+
+**原因**: HuggingFace 的 `LlamaTokenizerFast` / `AutoTokenizer` 加载 SentencePiece 模型时解析错误，返回错误的词表大小
+
+**解决方案** (手动重建 tokenizer.json):
+```python
+from tokenizers import Tokenizer, decoders, pre_tokenizers
+from tokenizers.models import Unigram
+from transformers import PreTrainedTokenizerFast
+
+# 1. 读取 SP 词表文件
+vocab_path = Path(work_dir) / "chinese_sp.vocab"
+vocab_list = []
+with open(vocab_path, "r", encoding="utf-8") as f:
+    for line in f:
+        parts = line.strip().split("\t")
+        if len(parts) >= 2:
+            vocab_list.append((parts[0], float(parts[1])))
+
+# 2. 用 tokenizers 库重建
+tokenizer_obj = Tokenizer(Unigram(vocab_list))
+tokenizer_obj.decoder = decoders.Metaspace()
+tokenizer_obj.pre_tokenizer = pre_tokenizers.Metaspace()
+tokenizer_obj.save(str(tokenizer_dir / "tokenizer.json"))
+
+# 3. 用 PreTrainedTokenizerFast 加载
+tokenizer = PreTrainedTokenizerFast(
+    tokenizer_file=str(tokenizer_dir / "tokenizer.json"),
+    bos_token="<s>", eos_token="</s>",
+    unk_token="<unk>", pad_token="<pad>",
+)
+```
+
+---
+
+### 17. Checkpoint 只保留最后 3 个，无法对比早期效果
+
+**现象**: 训练结束后只有 checkpoint-11000, 11500, 11838，无法对比 step 100/500/1000 时的随机生成效果
+
+**原因**: `save_total_limit=3` 导致早期 checkpoint 被自动删除
+
+**解决方案**:
+```python
+# 增加保留数量
+training_args = TrainingArguments(
+    save_steps=500,
+    save_total_limit=15,  # 保留更多 checkpoint
+    ...
+)
+```
+
+---
+
+### 18. 生成样本只打印到控制台，训练后无法找回
+
+**问题**: `GenerationCallback` 只 `print()` 生成结果，训练结束后无法查看历史样本
+
+**解决方案** (保存到日志文件):
+```python
+class GenerationCallback(TrainerCallback):
+    def __init__(self, tokenizer, work_dir, prompts=None):
+        self.log_file = Path(work_dir) / "generation_samples.log"
+        # 初始化日志
+        with open(self.log_file, "w", encoding="utf-8") as f:
+            f.write(f"# 创建时间: {datetime.now()}\n")
+    
+    def on_evaluate(self, args, state, control, model, **kwargs):
+        # ... 生成逻辑 ...
+        
+        # 保存到文件
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*70}\n")
+            f.write(f"Step {step} | Loss: {loss}\n")
+            for prompt, result in results:
+                f.write(f"[{prompt}] → {result}\n")
+```
+
+---
+
+### 19. argparse 参数名格式错误
+
+**报错信息**:
+```
+error: unrecognized arguments: --work-dir --batch-size
+```
+
+**原因**: Python argparse 定义时用的 `work_dir`，调用时用 `work-dir` (连字符 vs 下划线)
+
+**解决方案**:
+```bash
+# ❌ 错误
+python a100_train.py --work-dir gpt2-chinese --batch-size 48
+
+# ✅ 正确 (用下划线)
+python a100_train.py --work_dir gpt2-chinese --batch_size 48
+```
+
+**预防**: 在 argparse 定义时同时添加两种格式:
+```python
+parser.add_argument("--work_dir", "--work-dir", type=str, default="gpt2-chinese")
+```
+
+---
+
+### 20. eval_loss 不显示
+
+**现象**: 训练日志只有 `train_loss`，没有 `eval_loss`
+
+**原因**: 设置了 `prediction_loss_only=True`
+
+**解决方案**:
+```python
+training_args = TrainingArguments(
+    eval_strategy="steps",
+    eval_steps=500,
+    # prediction_loss_only=False,  # 注释掉或设为 False
+    ...
+)
+```
+
+---
+
+## 🟠 新增中等问题
+
+### 21. SCP 文件传输需要密码交互
+
+**现象**: `scp` 命令阻塞等待密码输入
+
+**解决方案**:
+1. 设置 SSH 免密登录
+2. 或使用 Base64 编码通过 SSH 传输:
+```bash
+# 服务器端: 编码压缩
+tar czf - files/ | base64 > transfer.b64
+
+# 本地: 解码
+cat transfer.b64 | base64 -d | tar xzf -
+```
+
+---
+
+### 22. Generation 时 results 变量未定义
+
+**报错信息**:
+```
+NameError: name 'results' is not defined
+```
+
+**原因**: 在循环前忘记初始化 `results = []`
+
+**解决方案**:
+```python
+def on_evaluate(...):
+    results = [header]  # 初始化列表
+    for prompt in self.prompts:
+        # ...
+        results.append(line)
+```
+
+---
+
+## 📋 训练日志保存检查清单
+
+运行训练前确保以下项目已配置:
+
+- [ ] `save_total_limit >= 10` (保留足够多的 checkpoint)
+- [ ] `GenerationCallback` 保存到文件而非只 print
+- [ ] `logging_steps=10` (频繁记录 loss)
+- [ ] `eval_strategy="steps"` + `eval_steps` 已设置
+- [ ] `report_to="tensorboard"` 或其他日志工具
+- [ ] 训练结束后下载 `trainer_state.json` + `generation_samples.log`
+
+---
+
+## 🔧 远程服务器训练完整流程
+
+```bash
+# 1. 上传脚本
+scp -P 35036 a100_train.py root@server:/root/autodl-tmp/
+
+# 2. SSH 连接
+ssh -p 35036 root@server
+
+# 3. 启动训练 (用 nohup 防止断连)
+cd /root/autodl-tmp
+nohup python3 a100_train.py --work_dir gpt2-chinese --batch_size 48 --use_bf16 > train.log 2>&1 &
+
+# 4. 查看进度
+tail -f train.log
+
+# 5. 训练完成后下载
+scp -P 35036 root@server:/root/autodl-tmp/gpt2-chinese/generation_samples.log ./
+scp -P 35036 -r root@server:/root/autodl-tmp/gpt2-chinese/checkpoints/checkpoint-*/trainer_state.json ./
+```
+
+---
+
+*最后更新: 2026-02-03 (补充训练日志保存经验)*

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from datetime import datetime
 """
 GPT-2 Chinese Pretraining Script for A100/A800 (v2 - FIXED)
 ============================================================
