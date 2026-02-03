@@ -40,6 +40,7 @@ from pathlib import Path
 from itertools import chain
 from concurrent.futures import ThreadPoolExecutor
 
+from datetime import datetime
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -490,6 +491,11 @@ def prepare_dataset(args, dataset, tokenizer):
         print_rank0("✅ 检测到已处理的数据集，从缓存加载")
         lm_dataset = load_from_disk(str(lm_dataset_path))
         print_rank0(f"   样本数: {len(lm_dataset)}")
+        # 打印数据集大小
+        import subprocess
+        result = subprocess.run(['du', '-sh', str(lm_dataset_path)], capture_output=True, text=True)
+        dataset_size = result.stdout.split()[0] if result.stdout else 'N/A'
+        print_rank0(f"   数据集大小: {dataset_size}")
         return lm_dataset
     
     # 只在主进程处理
@@ -539,7 +545,12 @@ def prepare_dataset(args, dataset, tokenizer):
         )
         
         lm_dataset.save_to_disk(str(lm_dataset_path))
+        # 打印数据集大小
+        import subprocess
+        result = subprocess.run(['du', '-sh', str(lm_dataset_path)], capture_output=True, text=True)
+        dataset_size = result.stdout.split()[0] if result.stdout else 'N/A'
         print_rank0(f"✅ 数据处理完成: {len(lm_dataset)} 样本")
+        print_rank0(f"📦 数据集大小: {dataset_size}")
     
     # 等待主进程
     if dist.is_initialized():
@@ -745,7 +756,7 @@ def train(args):
         eval_steps=500,
         save_strategy="steps",
         save_steps=500,
-        save_total_limit=3,
+        save_total_limit=15,  # 保留更多 checkpoint 用于效果对比
         # prediction_loss_only=False,  # 移除以显示 eval_loss
         
         logging_steps=10,
@@ -778,41 +789,69 @@ def train(args):
     from transformers import TrainerCallback
     
     class GenerationCallback(TrainerCallback):
-        """评估时测试生成质量"""
-        def __init__(self, tokenizer, prompts=None):
+        """评估时测试生成质量并保存到文件"""
+        def __init__(self, tokenizer, work_dir, prompts=None):
             self.tokenizer = tokenizer
-            self.prompts = prompts or ["中国的历史", "人工智能是", "今天天气"]
+            self.work_dir = Path(work_dir)
+            self.prompts = prompts or ["中国的历史", "人工智能是", "今天天气", "在科学研究中", "教育的目的"]
+            self.log_file = self.work_dir / "generation_samples.log"
+            # 初始化日志文件
+            if is_main_process():
+                with open(self.log_file, "w", encoding="utf-8") as f:
+                    f.write("# 训练过程中的生成样本日志\n")
+                    f.write(f"# 创建时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write("=" * 70 + "\n\n")
         
         def on_evaluate(self, args, state, control, model, **kwargs):
             if not is_main_process():
                 return
             
-            print("\n" + "=" * 50)
-            print(f"📝 Step {state.global_step} - 生成测试:")
-            print("=" * 50)
+            step = state.global_step
+            # 获取当前 loss
+            logs = state.log_history
+            current_loss = None
+            for log in reversed(logs):
+                if "loss" in log:
+                    current_loss = log["loss"]
+                    break
+            
+            loss_str = f"{current_loss:.4f}" if current_loss else "N/A"
+            header = f"\n{'='*70}\n📝 Step {step} | Loss: {loss_str}\n{'='*70}"
+            print(header)
             
             eval_model = model.module if hasattr(model, 'module') else model
-            # 处理 torch.compile 包装
             if hasattr(eval_model, '_orig_mod'):
                 eval_model = eval_model._orig_mod
             
             eval_model.eval()
             device = next(eval_model.parameters()).device
             
+            results = [header]
             for prompt in self.prompts:
                 try:
                     inputs = self.tokenizer(prompt, return_tensors="pt").to(device)
                     with torch.no_grad():
                         outputs = eval_model.generate(
-                            **inputs, max_new_tokens=50,
+                            **inputs, max_new_tokens=60,
                             do_sample=True, temperature=0.8, top_k=50,
                             pad_token_id=self.tokenizer.pad_token_id,
+                            no_repeat_ngram_size=2,
                         )
                     generated = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-                    print(f"   [{prompt}] → {generated[:80]}...")
+                    line = f"   [{prompt}] → {generated[:100]}"
+                    print(line)
+                    results.append(line)
                 except Exception as e:
-                    print(f"   [{prompt}] → 生成失败: {e}")
-            print("=" * 50 + "\n")
+                    line = f"   [{prompt}] → 生成失败: {e}"
+                    print(line)
+                    results.append(line)
+            
+            print("=" * 70 + "\n")
+            results.append("=" * 70 + "\n")
+            
+            # 保存到文件
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write("\n".join(results) + "\n")
     
     class DetailedLoggingCallback(TrainerCallback):
         """详细日志"""
@@ -835,7 +874,7 @@ def train(args):
     
     callbacks = [DetailedLoggingCallback()]
     if is_main_process():
-        callbacks.append(GenerationCallback(tokenizer))
+        callbacks.append(GenerationCallback(tokenizer, args.work_dir))
     
     # [FIX-14] 随机采样 eval_dataset
     eval_indices = random.sample(range(len(lm_dataset)), min(1000, len(lm_dataset)))

@@ -1,0 +1,7 @@
+# Requirements for HuggingFace Space (CPU)
+# Optimized for compatibility and original model effects
+
+gradio>=4.0.0
+transformers>=4.36.0
+torch>=2.0.0
+sentencepiece>=0.1.99

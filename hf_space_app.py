@@ -11,8 +11,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 
 # ============================================
-# 🔴 修改为您的模型 ID
-MODEL_ID = "YOUR_USERNAME/gpt2-chinese-mini"
+MODEL_ID = "Wilsonwin/gpt2-chinese-mini"
 # ============================================
 
 print(f"正在加载模型: {MODEL_ID}")
@@ -92,15 +91,16 @@ with gr.Blocks(
     gr.Markdown("""
     # 🇨🇳 中文 GPT-2 Mini - 从零预训练演示
     
-    这是一个在 **Kaggle 免费 GPU** 上从随机权重开始训练的中文语言模型。
+    这是一个在 **A100 GPU** 上从随机权重开始训练的中文语言模型。
     
     ### 📊 模型信息
     | 属性 | 值 |
     |---|---|
-    | 架构 | GPT-2 (6 层) |
-    | 参数量 | ~85M |
-    | 训练数据 | 中文维基百科 |
-    | 词表大小 | 32,000 |
+    | 架构 | GPT-2 (8 层, 768 维) |
+    | 参数量 | 82M |
+    | 训练数据 | 中文维基百科 + 知乎问答 |
+    | 词表大小 | 32,000 (SentencePiece) |
+    | 训练时长 | ~1.4 小时 (11,838 步) |
     
     > ⚠️ **注意**: 这是一个教学演示模型，生成质量有限，可能产生不准确或无意义的内容。
     """)
@@ -176,13 +176,13 @@ with gr.Blocks(
     gr.Markdown("""
     ---
     ### 🔗 相关链接
-    - [模型仓库](https://huggingface.co/YOUR_USERNAME/gpt2-chinese-mini) - 下载模型权重
-    - [训练代码](https://github.com/YOUR_USERNAME/gpt2-chinese) - 查看训练脚本
+    - [模型仓库](https://huggingface.co/Wilsonwin/gpt2-chinese-mini) - 下载模型权重
+    - [训练数据](https://huggingface.co/datasets/Wilsonwin/chinese-wiki-zhihu-corpus) - 7.56M 条中文语料
     
     ### 📚 技术细节
-    - **分词器**: SentencePiece Unigram (专为中文优化)
-    - **训练框架**: Hugging Face Transformers + Accelerate
-    - **训练硬件**: Kaggle T4 x2 GPU
+    - **分词器**: SentencePiece Unigram (32K 词表，专为中文优化)
+    - **训练框架**: Hugging Face Transformers + Flash Attention 2 + 8-bit AdamW
+    - **训练硬件**: AutoDL A100 40GB
     """)
 
 
