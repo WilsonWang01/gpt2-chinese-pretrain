@@ -1,0 +1,787 @@
+# === Cell 1: 环境诊断与库安装 ===
+import os
+# 启用双 GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+# 检查 GPU 可用性
+!nvidia-smi
+# 安装依赖（不指定版本，使用 Kaggle 预装的兼容版本）
+!pip install -q \
+    transformers datasets accelerate \
+    huggingface_hub sentencepiece tokenizers \
+    bitsandbytes \
+    liger-kernel
+# 验证安装
+import torch
+print(f"PyTorch: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"GPU count: {torch.cuda.device_count()}")
+for i in range(torch.cuda.device_count()):
+    print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+# 注意：Kaggle 环境不支持 DDP，Trainer 会自动使用 DataParallel
+
+
+# === Cell 2: HuggingFace Hub 登录 ===
+from huggingface_hub import notebook_login, HfFolder
+# 方法 1: 交互式登录 (需要手动输入 token)
+notebook_login()
+# 方法 2: 非交互式 (用于 "Save & Run All" 模式)
+# import os
+# os.environ["HF_TOKEN"] = "hf_your_token_here"
+# HfFolder.save_token(os.environ["HF_TOKEN"])
+# 验证登录状态
+from huggingface_hub import whoami
+try:
+    user_info = whoami()
+    HF_USERNAME = user_info["name"]
+    print(f"✅ 已登录为: {HF_USERNAME}")
+except Exception as e:
+    print(f"❌ 登录失败: {e}")
+    HF_USERNAME = "your_username"  # 需手动填写
+
+
+    # === Cell 3: 多数据集加载（推荐）===
+from datasets import load_dataset, concatenate_datasets, Dataset
+import os
+print("📥 正在下载多个数据集...")
+# === 1. 加载维基百科（完整）===
+print("   [1/2] 加载维基百科...")
+wiki = load_dataset(
+    "pleisto/wikipedia-cn-20230720-filtered",
+    split="train",  # 完整数据
+)
+print(f"   ✅ 维基百科: {len(wiki)} 条")
+# === 2. 加载知乎高赞回答 ===
+print("   [2/2] 加载知乎...")
+zhihu = load_dataset(
+    "wangrui6/Zhihu-KOL",
+    split="train",
+)
+print(f"   ✅ 知乎: {len(zhihu)} 条")
+# === 3. 统一字段名并合并 ===
+# 维基百科字段: completion
+# 知乎字段: INSTRUCTION, RESPONSE (需要合并)
+def process_wiki(example):
+    return {"text": example["completion"]}
+def process_zhihu(example):
+    # 合并问题和回答
+    text = f"{example['INSTRUCTION']}\n{example['RESPONSE']}"
+    return {"text": text}
+print("🔄 正在处理数据格式...")
+wiki_processed = wiki.map(process_wiki, remove_columns=wiki.column_names, num_proc=4)
+zhihu_processed = zhihu.map(process_zhihu, remove_columns=zhihu.column_names, num_proc=4)
+# 合并数据集
+dataset = concatenate_datasets([wiki_processed, zhihu_processed])
+dataset = dataset.shuffle(seed=42)
+print(f"\n✅ 数据集合并完成!")
+print(f"   维基百科: {len(wiki)} 条")
+print(f"   知乎: {len(zhihu)} 条")
+print(f"   合计: {len(dataset)} 条")
+print(f"   示例: {dataset[0]['text'][:100]}...")
+# === 4. 导出为纯文本供分词器训练（优化版）===
+CORPUS_FILE = "/kaggle/working/combined_corpus.txt"
+print("📝 正在导出纯文本（优化版）...")
+# 使用 map + 批量写入，比 for 循环快 5-10 倍
+def filter_short(example):
+    return len(example["text"].strip()) > 50
+# 过滤短文本
+filtered = dataset.filter(filter_short, num_proc=4)
+print(f"   过滤后: {len(filtered)} 条 (原 {len(dataset)} 条)")
+# 批量写入文件
+BATCH_SIZE = 10000
+with open(CORPUS_FILE, "w", encoding="utf-8") as f:
+    for i in range(0, len(filtered), BATCH_SIZE):
+        batch = filtered[i:i+BATCH_SIZE]["text"]
+        f.write("\n".join(text.strip() for text in batch) + "\n")
+        if (i // BATCH_SIZE) % 10 == 0:
+            print(f"   已导出 {min(i+BATCH_SIZE, len(filtered))}/{len(filtered)}...")
+# 统计语料规模
+file_size_mb = os.path.getsize(CORPUS_FILE) / (1024 * 1024)
+with open(CORPUS_FILE, "r", encoding="utf-8") as f:
+    line_count = sum(1 for _ in f)
+print(f"✅ 语料导出完成: {file_size_mb:.1f} MB, {line_count} 行")
+
+
+# === Cell 4: 训练 SentencePiece 分词器（带缓存检测）===
+import sentencepiece as spm
+import os
+import random
+import multiprocessing
+import time
+
+MODEL_PREFIX = "/kaggle/working/chinese_sp"
+VOCAB_SIZE = 32000
+SAMPLE_SIZE = 500000
+
+# === 缓存检测：如果分词器已存在则跳过 ===
+if os.path.exists(f"{MODEL_PREFIX}.model") and os.path.exists(f"{MODEL_PREFIX}.vocab"):
+    print("=" * 50)
+    print("✅ 检测到已训练的分词器，跳过训练")
+    print(f"   模型文件: {MODEL_PREFIX}.model")
+    print(f"   词表文件: {MODEL_PREFIX}.vocab")
+    # 验证分词器
+    sp = spm.SentencePieceProcessor(model_file=f"{MODEL_PREFIX}.model")
+    test_text = "人工智能正在改变世界"
+    tokens = sp.encode(test_text, out_type=str)
+    print(f"   测试分词: {test_text} → {tokens}")
+    print("=" * 50)
+else:
+    # === 训练新分词器 ===
+    print(f"📝 采样 {SAMPLE_SIZE} 句用于分词器训练...")
+    print(f"   CPU 核心数: {multiprocessing.cpu_count()}")
+    
+    random.seed(42)
+    indices = list(range(len(dataset)))
+    random.shuffle(indices)
+    sampled_indices = indices[:SAMPLE_SIZE]
+    
+    sampled_dataset = dataset.select(sampled_indices)
+    
+    def filter_text(example):
+        text = example["text"].strip()
+        if 50 < len(text) < 5000:
+            return {"text": text, "valid": True}
+        return {"text": "", "valid": False}
+    
+    print("🔄 并行处理文本...")
+    processed = sampled_dataset.map(
+        filter_text,
+        num_proc=multiprocessing.cpu_count(),
+        desc="Processing"
+    )
+    
+    valid_texts = [ex["text"] for ex in processed if ex["valid"]]
+    print(f"✅ 有效文本: {len(valid_texts)} 句")
+    
+    with open(CORPUS_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(valid_texts))
+    corpus_size_mb = os.path.getsize(CORPUS_FILE) / 1024 / 1024
+    print(f"✅ 语料导出完成: {corpus_size_mb:.1f} MB")
+    
+    # 训练分词器
+    print("=" * 50)
+    print("🔤 开始训练分词器...")
+    print(f"   词表大小: {VOCAB_SIZE}")
+    print(f"   训练句数: {len(valid_texts)}")
+    print(f"   CPU 线程: {os.cpu_count() or 4}")
+    print("   ⏳ 预计耗时 2-5 分钟，请耐心等待...")
+    print("=" * 50)
+    
+    start_time = time.time()
+    spm.SentencePieceTrainer.train(
+        input=CORPUS_FILE,
+        model_prefix=MODEL_PREFIX,
+        vocab_size=VOCAB_SIZE,
+        model_type="unigram",
+        character_coverage=0.9995,
+        input_sentence_size=500000,
+        shuffle_input_sentence=True,
+        max_sentence_length=1024,
+        train_extremely_large_corpus=False,
+        pad_id=0, unk_id=1, bos_id=2, eos_id=3,
+        pad_piece="<pad>", unk_piece="<unk>",
+        bos_piece="<s>", eos_piece="</s>",
+        num_threads=os.cpu_count() or 4,
+        normalization_rule_name="nmt_nfkc_cf",
+        split_by_unicode_script=True,
+        split_by_number=True,
+    )
+    elapsed = time.time() - start_time
+    print("=" * 50)
+    print(f"✅ 分词器训练完成! 耗时: {elapsed:.1f} 秒")
+    print(f"   模型文件: {MODEL_PREFIX}.model")
+    print(f"   词表文件: {MODEL_PREFIX}.vocab")
+    
+    # 验证分词器
+    sp = spm.SentencePieceProcessor(model_file=f"{MODEL_PREFIX}.model")
+    test_text = "人工智能正在改变世界"
+    tokens = sp.encode(test_text, out_type=str)
+    print(f"   测试分词: {test_text} → {tokens}")
+
+
+# === Cell 5: 转换分词器为 HuggingFace 格式（带缓存检测）===
+import sentencepiece as spm
+from transformers import PreTrainedTokenizerFast, LlamaTokenizerFast, AutoTokenizer
+import json
+import os
+import shutil
+
+TOKENIZER_DIR = "/kaggle/working/tokenizer"
+
+# === 缓存检测：如果 HF 格式分词器已存在则跳过 ===
+if os.path.exists(f"{TOKENIZER_DIR}/tokenizer.json"):
+    print("=" * 50)
+    print("✅ 检测到已转换的 HuggingFace 分词器，跳过转换")
+    print(f"   目录: {TOKENIZER_DIR}")
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
+    print(f"   词表大小: {len(tokenizer)}")
+    # 测试分词
+    test_text = "人工智能是未来科技发展的重要方向。"
+    tokens = tokenizer.tokenize(test_text)
+    print(f"   测试: {test_text[:20]}... → {tokens[:5]}...")
+    print("=" * 50)
+else:
+    # === 转换分词器 ===
+    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+    
+    # 复制模型文件
+    shutil.copy(f"{MODEL_PREFIX}.model", f"{TOKENIZER_DIR}/spiece.model")
+    shutil.copy(f"{MODEL_PREFIX}.vocab", f"{TOKENIZER_DIR}/spiece.vocab")
+    
+    # 创建 tokenizer_config.json
+    tokenizer_config = {
+        "bos_token": "<s>",
+        "eos_token": "</s>",
+        "unk_token": "<unk>",
+        "pad_token": "<pad>",
+        "sp_model_kwargs": {},
+        "add_bos_token": False,
+        "add_eos_token": False,
+        "model_max_length": 512,
+        "tokenizer_class": "PreTrainedTokenizerFast"
+    }
+    with open(f"{TOKENIZER_DIR}/tokenizer_config.json", "w") as f:
+        json.dump(tokenizer_config, f, indent=2, ensure_ascii=False)
+    
+    # 创建 special_tokens_map.json
+    special_tokens = {
+        "bos_token": "<s>",
+        "eos_token": "</s>",
+        "unk_token": "<unk>",
+        "pad_token": "<pad>"
+    }
+    with open(f"{TOKENIZER_DIR}/special_tokens_map.json", "w") as f:
+        json.dump(special_tokens, f, indent=2, ensure_ascii=False)
+    
+    # 使用 LlamaTokenizerFast 加载 SP 模型
+    tokenizer = LlamaTokenizerFast(
+        vocab_file=f"{MODEL_PREFIX}.model",
+        bos_token="<s>",
+        eos_token="</s>",
+        unk_token="<unk>",
+        pad_token="<pad>",
+        add_bos_token=False,
+        add_eos_token=True,
+    )
+    
+    # 保存为标准 HuggingFace 格式
+    tokenizer.save_pretrained(TOKENIZER_DIR)
+    print(f"✅ 分词器转换完成!")
+    print(f"   目录: {TOKENIZER_DIR}")
+    print(f"   词表大小: {len(tokenizer)}")
+    
+    # === 上传分词器到 HuggingFace Hub ===
+    TOKENIZER_REPO = f"{HF_USERNAME}/chinese-sp-32k"
+    try:
+        tokenizer.push_to_hub(TOKENIZER_REPO)
+        print(f"\n🚀 分词器已上传至: https://huggingface.co/{TOKENIZER_REPO}")
+        print(f"   使用方式: AutoTokenizer.from_pretrained('{TOKENIZER_REPO}')")
+    except Exception as e:
+        print(f"⚠️ 上传失败: {e}")
+        print("   可稍后手动上传: tokenizer.push_to_hub('你的仓库名')")
+    
+    # 测试分词效果
+    test_text = "人工智能是未来科技发展的重要方向。"
+    tokens = tokenizer.tokenize(test_text)
+    ids = tokenizer.encode(test_text)
+    print(f"\n测试分词:")
+    print(f"   原文: {test_text}")
+    print(f"   Tokens: {tokens}")
+    print(f"   IDs: {ids}")
+    print(f"   解码: {tokenizer.decode(ids)}")
+
+
+# === Cell 6: GPT-2 模型配置与初始化 ===
+from transformers import GPT2Config, GPT2LMHeadModel
+# 重新加载分词器 (确保使用最新保存的版本)
+from transformers import AutoTokenizer
+tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
+# === 模型配置（优化版）===
+config = GPT2Config(
+    vocab_size=len(tokenizer),
+    
+    # === 架构（优化后）===
+    n_positions=1024,                   # 增大 context（显存优化后支持）
+    n_ctx=1024,
+    n_embd=768,
+    n_layer=6,
+    n_head=12,
+    n_inner=3072,
+    activation_function="gelu_new",
+    
+    # === 正则化（预训练阶段关闭 dropout）===
+    resid_pdrop=0.0,
+    embd_pdrop=0.0,
+    attn_pdrop=0.0,
+    
+    # === 特殊 Token ID ===
+    bos_token_id=tokenizer.bos_token_id,
+    eos_token_id=tokenizer.eos_token_id,
+    pad_token_id=tokenizer.pad_token_id,
+)
+# === 优化 0: SDPA Attention ===
+try:
+    config._attn_implementation = "sdpa"
+    print("✅ 已设置 SDPA attention（Memory-Efficient 后端）")
+except:
+    pass
+# 初始化模型 (随机权重)
+model = GPT2LMHeadModel(config)
+print(f"✅ 参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
+# === 优化 1: Liger Kernel LayerNorm（+30% 速度）===
+try:
+    from liger_kernel.transformers import LigerLayerNorm
+    import torch.nn as nn
+    
+    def patch_layernorm(model):
+        patched_count = 0
+        for name, module in list(model.named_modules()):
+            if isinstance(module, nn.LayerNorm):
+                parent_name = '.'.join(name.split('.')[:-1])
+                child_name = name.split('.')[-1]
+                parent = model.get_submodule(parent_name) if parent_name else model
+                liger_ln = LigerLayerNorm(module.normalized_shape, eps=module.eps)
+                liger_ln.weight = module.weight
+                if module.bias is not None:
+                    liger_ln.bias = module.bias
+                setattr(parent, child_name, liger_ln)
+                patched_count += 1
+        return model, patched_count
+    
+    model, count = patch_layernorm(model)
+    print(f"✅ 已替换 {count} 个 LayerNorm 为 Liger 版本")
+except ImportError:
+    print("⚠️ liger-kernel 未安装，跳过 LayerNorm 优化")
+# 保存 lm_head.weight（供 FusedLinearCrossEntropy 使用）
+LM_HEAD_WEIGHT = model.lm_head.weight
+
+# === 优化 2: torch.compile ===
+# 注意：torch.compile 和 DataParallel 不兼容，选择 DataParallel（使用双 GPU）
+# 如果只有单 GPU，可以启用 torch.compile
+USE_COMPILE = False  # DataParallel 模式下必须禁用
+if USE_COMPILE and torch.cuda.device_count() == 1:
+    try:
+        model = torch.compile(model)
+        print("✅ 已启用 torch.compile")
+    except Exception as e:
+        print(f"⚠️ torch.compile 不可用: {e}")
+
+# === 优化 3: Gradient Checkpointing（在 DataParallel 之前启用）===
+# 必须在包装 DataParallel 之前启用，否则 Trainer 会报错
+model.gradient_checkpointing_enable()
+print("✅ 已启用 Gradient Checkpointing")
+
+# 强制使用 DataParallel（双 GPU）
+if torch.cuda.device_count() > 1:
+    print(f"🎮 启用 DataParallel，使用 {torch.cuda.device_count()} 个 GPU")
+    model = torch.nn.DataParallel(model)
+
+# === Cell 7: 数据预处理与 Packing（带缓存检测）===
+from datasets import Dataset, load_from_disk
+import numpy as np
+import multiprocessing
+import time
+from itertools import chain
+
+NUM_PROC = multiprocessing.cpu_count()
+BLOCK_SIZE = 1024
+LM_DATASET_PATH = "/kaggle/working/lm_dataset"
+
+# === 缓存检测：如果处理后的数据集已存在则跳过 ===
+if os.path.exists(LM_DATASET_PATH):
+    print("=" * 50)
+    print("✅ 检测到已处理的数据集，从缓存加载")
+    print(f"   路径: {LM_DATASET_PATH}")
+    lm_dataset = load_from_disk(LM_DATASET_PATH)
+    print(f"   样本数: {len(lm_dataset)} 个 {BLOCK_SIZE}-token 块")
+    print(f"   总 Token: {len(lm_dataset) * BLOCK_SIZE / 1e9:.2f}B")
+    # 验证数据
+    sample = lm_dataset[0]
+    print(f"   解码: {tokenizer.decode(sample['input_ids'][:50])}...")
+    print("=" * 50)
+else:
+    print(f"🖥️ 使用 {NUM_PROC} 个 CPU 核心并行处理")
+    
+    # === 步骤 1: Tokenize 所有文本 ===
+    print("=" * 50)
+    print("🔄 正在 Tokenize...")
+    tokenize_start = time.time()
+    
+    text_column = "text" if "text" in dataset.column_names else "completion"
+    print(f"   字段: {text_column}")
+    print(f"   样本数: {len(dataset)}")
+    
+    def tokenize_function(examples):
+        return tokenizer(
+            examples[text_column],
+            add_special_tokens=True,
+            truncation=False,
+            return_attention_mask=False,
+        )
+    
+    tokenized_dataset = dataset.map(
+        tokenize_function,
+        batched=True,
+        batch_size=5000,
+        remove_columns=dataset.column_names,
+        num_proc=NUM_PROC,
+        desc="Tokenizing",
+    )
+    tokenize_time = time.time() - tokenize_start
+    print(f"✅ Tokenization 完成: {len(tokenized_dataset)} 样本, 耗时 {tokenize_time:.1f}s")
+    
+    # === 步骤 2: Packing ===
+    print("=" * 50)
+    print("📦 正在 Packing...")
+    pack_start = time.time()
+    
+    def group_texts(examples):
+        concatenated = {k: list(chain.from_iterable(examples[k])) for k in examples.keys()}
+        total_length = len(concatenated["input_ids"])
+        
+        if total_length >= BLOCK_SIZE:
+            total_length = (total_length // BLOCK_SIZE) * BLOCK_SIZE
+        
+        result = {
+            k: [t[i : i + BLOCK_SIZE] for i in range(0, total_length, BLOCK_SIZE)]
+            for k, t in concatenated.items()
+        }
+        result["labels"] = result["input_ids"].copy()
+        return result
+    
+    lm_dataset = tokenized_dataset.map(
+        group_texts,
+        batched=True,
+        batch_size=5000,
+        num_proc=NUM_PROC,
+        desc="Packing",
+    )
+    pack_time = time.time() - pack_start
+    
+    # 保存到磁盘作为缓存
+    lm_dataset.save_to_disk(LM_DATASET_PATH)
+    
+    total_time = tokenize_time + pack_time
+    print("=" * 50)
+    print(f"✅ 数据处理完成!")
+    print(f"   Tokenize: {tokenize_time:.1f}s")
+    print(f"   Packing: {pack_time:.1f}s")
+    print(f"   总耗时: {total_time:.1f}s")
+    print(f"   样本数: {len(lm_dataset)} 个 {BLOCK_SIZE}-token 块")
+    print(f"   总 Token: {len(lm_dataset) * BLOCK_SIZE / 1e9:.2f}B")
+    print(f"   已缓存至: {LM_DATASET_PATH}")
+    
+    # 验证数据
+    sample = lm_dataset[0]
+    print(f"\n📊 数据样本:")
+    print(f"   解码: {tokenizer.decode(sample['input_ids'][:50])}...")
+
+
+# === Cell 8: 训练参数配置 ===
+from transformers import TrainingArguments, Trainer, DataCollatorForLanguageModeling
+# === 模型命名 ===
+MODEL_NAME = "gpt2-chinese-mini"
+REPO_ID = f"{HF_USERNAME}/{MODEL_NAME}"
+# === 训练参数（显存优化版）===
+NUM_EPOCHS = 2
+BATCH_SIZE_PER_GPU = 16              # DataParallel 模式下降低 batch size
+GRADIENT_ACCUMULATION = 2
+NUM_GPUS = 2
+BLOCK_SIZE = 1024
+# 有效 batch size = 24 * 2 * 2 = 96 samples
+# 每个 sample 1024 tokens = ~98K tokens per update
+effective_batch_size = BATCH_SIZE_PER_GPU * GRADIENT_ACCUMULATION * NUM_GPUS
+tokens_per_update = effective_batch_size * BLOCK_SIZE
+steps_per_epoch = len(lm_dataset) // effective_batch_size
+total_steps = steps_per_epoch * NUM_EPOCHS
+print(f"📊 训练规模:")
+print(f"   每 GPU batch: {BATCH_SIZE_PER_GPU}")
+print(f"   梯度累积: {GRADIENT_ACCUMULATION}")
+print(f"   有效 batch: {effective_batch_size}")
+print(f"   每步 tokens: {tokens_per_update / 1e3:.1f}K")
+print(f"   总步数: {total_steps}")
+# === 训练参数 ===
+training_args = TrainingArguments(
+    output_dir=f"/kaggle/working/{MODEL_NAME}",
+    overwrite_output_dir=True,
+    
+    # === 训练规模 ===
+    num_train_epochs=NUM_EPOCHS,
+    per_device_train_batch_size=BATCH_SIZE_PER_GPU,
+    gradient_accumulation_steps=GRADIENT_ACCUMULATION,
+    
+    # === 学习率调度（针对大 batch 优化）===
+    learning_rate=3e-4,                  # 大 batch 时降低 LR
+    warmup_steps=2000,                   # 约 5% 总步数
+    lr_scheduler_type="cosine",
+    
+    # === 优化器（8-bit 优化，显存减少 75%）===
+    optim="adamw_bnb_8bit",
+    weight_decay=0.1,
+    adam_beta1=0.9,
+    adam_beta2=0.95,
+    max_grad_norm=1.0,
+    
+    # === 精度 ===
+    fp16=True,
+    bf16=False,                          # T4 不支持
+    gradient_checkpointing=False,        # 已在 Cell 6 手动启用（DataParallel 前）
+    
+    # === 数据加载优化 ===
+    dataloader_num_workers=4,
+    dataloader_pin_memory=True,
+    dataloader_prefetch_factor=4,
+    dataloader_persistent_workers=True,
+    
+    # === Checkpoint ===
+    eval_strategy="steps",
+    eval_steps=500,
+    save_strategy="steps",
+    save_steps=500,
+    save_total_limit=3,
+    load_best_model_at_end=False,
+    prediction_loss_only=True,    # 强制计算 eval loss
+    
+    # === 日志与 Hub ===
+    logging_steps=1,               # 前几步每步打印，确认无误后改为 100
+    logging_first_step=True,
+    report_to="none",
+    push_to_hub=True,
+    hub_model_id=REPO_ID,
+    hub_strategy="checkpoint",
+    
+    # === 分布式 ===
+    ddp_find_unused_parameters=False,
+    remove_unused_columns=False,  # torch.compile 兼容
+    seed=42,
+)
+print(f"\n✅ 训练配置完成")
+print(f"   Warmup 步数: {training_args.warmup_steps}")
+print(f"   LR 调度: {training_args.lr_scheduler_type}")
+print(f"   优化器: {training_args.optim}")
+print(f"   保存间隔: {training_args.save_steps} 步") 
+
+
+# === Cell 9: Data Collator 配置 ===
+# 语言模型专用 Data Collator
+data_collator = DataCollatorForLanguageModeling(
+    tokenizer=tokenizer,
+    mlm=False,  # 因果语言模型 (非 Masked LM)
+)
+# 测试 collator
+test_batch = [lm_dataset[i] for i in range(4)]
+collated = data_collator(test_batch)
+print("📦 Data Collator 测试:")
+print(f"   input_ids shape: {collated['input_ids'].shape}")
+print(f"   labels shape: {collated['labels'].shape}") 
+
+
+# === Cell 10: 自定义 Trainer + 生成回调 ===
+from transformers import Trainer, TrainerCallback
+# 确保 LM_HEAD_WEIGHT 存在（如果之前的 Cell 没有定义）
+try:
+    LM_HEAD_WEIGHT
+except NameError:
+    # 处理 DataParallel 包装
+    base_model = model.module if hasattr(model, 'module') else model
+    # 处理 torch.compile 包装
+    base_model = base_model._orig_mod if hasattr(base_model, '_orig_mod') else base_model
+    LM_HEAD_WEIGHT = base_model.lm_head.weight
+    print("✅ 已获取 LM_HEAD_WEIGHT")
+# === 生成回调：每次评估时测试 prompt ===
+class GenerationCallback(TrainerCallback):
+    def __init__(self, tokenizer, prompts=None):
+        self.tokenizer = tokenizer
+        self.prompts = prompts or ["中国的历史", "人工智能是", "知乎上有人问"]
+    
+    def on_evaluate(self, args, state, control, model, **kwargs):
+        print("\n" + "=" * 50)
+        print(f"📝 Step {state.global_step} - 生成样本:")
+        print("=" * 50)
+        
+        # 处理 DataParallel 和 torch.compile 包装
+        eval_model = model
+        if hasattr(model, 'module'):  # DataParallel
+            eval_model = model.module
+        if hasattr(eval_model, '_orig_mod'):  # torch.compile
+            eval_model = eval_model._orig_mod
+        
+        eval_model.eval()
+        device = next(eval_model.parameters()).device
+        for prompt in self.prompts:
+            try:
+                inputs = self.tokenizer(prompt, return_tensors="pt").to(device)
+                with torch.no_grad():
+                    outputs = eval_model.generate(
+                        **inputs, max_new_tokens=50,
+                        do_sample=True, temperature=0.8, top_k=50,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                    )
+                generated = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                print(f"  [{prompt}] → {generated}")
+            except Exception as e:
+                print(f"  [{prompt}] → 生成失败: {e}")
+        print("=" * 50 + "\n")
+        eval_model.train()
+# === 日志回调：前 10 步每步打印，之后每 100 步 ===
+class LoggingCallback(TrainerCallback):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs:
+            loss = logs.get("loss", logs.get("eval_loss", None))
+            if loss is not None:
+                step = state.global_step
+                # 前 10 步每步打印，之后每 100 步打印
+                if step <= 10 or step % 100 == 0:
+                    lr = logs.get("learning_rate", 0)
+                    print(f"📊 Step {step}: loss={loss:.4f}, lr={lr:.2e}")
+# === LigerTrainer: 使用 FusedLinearCrossEntropy ===
+USE_FUSED_CE = False  # 设置为 False 可禁用
+try:
+    from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+    
+    class LigerTrainer(Trainer):
+        """使用 FusedLinearCrossEntropy，显存 -60~80%"""
+        def __init__(self, *args, lm_head_weight=None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.fused_loss_fn = LigerFusedLinearCrossEntropyLoss()
+            self.lm_head_weight = lm_head_weight
+            print("✅ LigerTrainer: 已启用 FusedLinearCrossEntropy")
+        
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            labels = inputs.pop("labels")
+            base_model = getattr(model, '_orig_mod', model)
+            transformer = getattr(base_model, 'transformer', None)
+            outputs = transformer(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs.get("attention_mask"),
+            )
+            hidden_states = outputs.last_hidden_state
+            shift_hidden = hidden_states[..., :-1, :].contiguous().view(-1, hidden_states.size(-1))
+            shift_labels = labels[..., 1:].contiguous().view(-1)
+            loss = self.fused_loss_fn(self.lm_head_weight, shift_hidden, shift_labels)
+            if return_outputs:
+                from transformers.modeling_outputs import CausalLMOutputWithPast
+                return loss, CausalLMOutputWithPast(loss=loss)
+            return loss
+    
+    if USE_FUSED_CE:
+        TrainerClass = LigerTrainer
+        trainer_kwargs = {"lm_head_weight": LM_HEAD_WEIGHT}
+        print("✅ 将使用 LigerTrainer + FusedLinearCrossEntropy")
+    else:
+        TrainerClass = Trainer
+        trainer_kwargs = {}
+except ImportError:
+    print("⚠️ liger-kernel 未安装，使用标准 Trainer")
+    TrainerClass = Trainer
+    trainer_kwargs = {}
+# === 创建 Trainer ===
+generation_callback = GenerationCallback(
+    tokenizer=tokenizer,
+    prompts=["中国的历史", "人工智能是", "知乎上有人问", "科学技术的发展"]
+)
+logging_callback = LoggingCallback()
+trainer = TrainerClass(
+    model=model,
+    args=training_args,
+    train_dataset=lm_dataset,
+    eval_dataset=lm_dataset.select(range(min(1000, len(lm_dataset)))),
+    tokenizer=tokenizer,
+    data_collator=data_collator,
+    callbacks=[generation_callback, logging_callback],  # 两个回调
+    **trainer_kwargs,
+)
+print("🎯 Trainer 创建完成!")
+
+
+# === Cell 11: 多 GPU 训练（DataParallel 模式）===
+# 注意：Kaggle 环境不支持 DDP，Trainer 会自动使用 DataParallel
+import time
+import gc
+import torch
+# 清理 GPU 缓存
+gc.collect()
+torch.cuda.empty_cache()
+print("=" * 60)
+print("🚀 开始多 GPU 预训练")
+print("=" * 60)
+print(f"⏰ 开始时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"🖥️ GPU 显存: {torch.cuda.memory_allocated() / 1024**3:.2f} GB 已用")
+print(f"🎮 GPU 数量: {torch.cuda.device_count()}")
+print(f"📍 模型将上传至: https://huggingface.co/{REPO_ID}")
+print()
+print("📈 Loss 参考:")
+print("   初始 (随机权重): ~10.0 - 11.0")
+print("   500 步后: ~6.0 - 7.0")
+print("   收敛目标: < 4.0")
+print("=" * 60)
+# === 关键检查：vocab_size 一致性 ===
+# 处理 DataParallel 包装
+base_model = model.module if hasattr(model, 'module') else model
+model_vocab = base_model.config.vocab_size
+tokenizer_vocab = len(tokenizer)
+print(f"\n🔍 vocab_size 检查:")
+print(f"   模型: {model_vocab}")
+print(f"   分词器: {tokenizer_vocab}")
+if model_vocab != tokenizer_vocab:
+    print(f"❌ 错误: vocab_size 不匹配! 模型={model_vocab}, 分词器={tokenizer_vocab}")
+    print("   请重新运行 Cell 6 创建模型，确保使用 vocab_size=len(tokenizer)")
+    raise ValueError(f"vocab_size mismatch: model={model_vocab}, tokenizer={tokenizer_vocab}")
+# 检查整个数据集的 token ID 范围（抽样检查）
+print("   检查数据集 token ID 范围...")
+max_token_id = 0
+problem_samples = []
+for i in range(0, len(lm_dataset), max(1, len(lm_dataset) // 100)):  # 抽样 100 个
+    sample_ids = lm_dataset[i]["input_ids"]
+    sample_max = max(sample_ids)
+    if sample_max > max_token_id:
+        max_token_id = sample_max
+    if sample_max >= model_vocab:
+        problem_samples.append((i, sample_max))
+print(f"   数据集最大 token ID: {max_token_id}")
+print(f"   模型 vocab_size: {model_vocab}")
+if problem_samples:
+    print(f"❌ 发现 {len(problem_samples)} 个样本的 token ID 越界!")
+    for idx, max_id in problem_samples[:5]:
+        print(f"   样本 {idx}: max_token_id = {max_id} >= {model_vocab}")
+    print("\n💡 解决方案:")
+    print("   1. 删除 /kaggle/working/tokenizer 目录")
+    print("   2. 重新运行 Cell 4 (训练分词器)")
+    print("   3. 重新运行 Cell 5 (保存分词器)")
+    print("   4. 重新运行 Cell 6-10")
+    raise ValueError(f"Token IDs out of range!")
+if max_token_id >= model_vocab:
+    print(f"❌ 错误: token ID {max_token_id} >= vocab_size {model_vocab}")
+    raise ValueError(f"Token ID out of range: {max_token_id} >= {model_vocab}")
+print("✅ vocab_size 检查通过!\n")
+# === 开始训练 ===
+try:
+    trainer.train()
+    print("\n✅ 训练完成!")
+    
+    # 保存模型
+    trainer.save_model()
+    tokenizer.save_pretrained(f"/kaggle/working/{MODEL_NAME}")
+    
+    # 上传到 Hub
+    print("\n📤 正在上传最终模型到 HuggingFace Hub...")
+    from huggingface_hub import HfApi
+    api = HfApi()
+    api.upload_folder(
+        folder_path=f"/kaggle/working/{MODEL_NAME}",
+        repo_id=REPO_ID,
+        commit_message="Training complete"
+    )
+    print(f"\n🎉 模型已发布至: https://huggingface.co/{REPO_ID}")
+    
+except KeyboardInterrupt:
+    print("\n⚠️ 训练被中断，正在保存当前状态...")
+    trainer.save_model()
+    print("💾 模型已保存，下次可用 resume_from_checkpoint=True 继续")
+    
+except Exception as e:
+    print(f"\n❌ 训练出错: {e}")
+    print("\n💡 排错指南:")
+    print("   - OOM: 减少 BATCH_SIZE_PER_GPU")
+    print("   - 速度慢: 检查 gradient_checkpointing")
+    print("   - Loss 不降: 检查数据和 learning_rate")
+    raise

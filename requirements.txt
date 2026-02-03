@@ -1,0 +1,18 @@
+# Core dependencies
+transformers>=4.30.0
+datasets>=2.14.0
+torch>=2.0.0
+sentencepiece>=0.1.99
+accelerate>=0.21.0
+
+# Optimization (optional)
+bitsandbytes>=0.41.0  # 8-bit optimizer
+
+# For Gradio demo
+gradio>=4.0.0
+
+# For HuggingFace Hub
+huggingface_hub>=0.16.0
+
+# Flash Attention (optional, install separately)
+# pip install flash-attn --no-build-isolation
