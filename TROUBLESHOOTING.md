@@ -526,3 +526,153 @@ scp -P 35036 -r root@server:/root/autodl-tmp/gpt2-chinese/checkpoints/checkpoint
 ---
 
 *最后更新: 2026-02-03 (补充训练日志保存经验)*
+
+---
+
+## 🚀 HuggingFace Hub 部署问题
+
+### 23. 模型上传后无法加载 (Tokenizer 问题)
+
+**报错信息**:
+```
+Can't load tokenizer for 'username/model-name'
+OSError: Can't load tokenizer
+```
+
+**原因**: 只上传了 model 文件夹，没有上传 tokenizer 相关文件
+
+**解决方案**:
+```python
+# 上传时同时保存 tokenizer
+tokenizer.save_pretrained(str(final_path))
+model.save_pretrained(str(final_path))
+
+# 确保以下文件都存在:
+# - tokenizer.json
+# - tokenizer_config.json  
+# - special_tokens_map.json
+# - config.json (模型)
+# - model.safetensors 或 pytorch_model.bin
+```
+
+---
+
+### 24. HuggingFace Space Building 卡住
+
+**现象**: Space 状态一直是 "Building"，没有变成 "Running"
+
+**常见原因及解决**:
+
+1. **依赖安装失败** - 检查 `requirements.txt` 版本兼容性
+   ```txt
+   # ❌ 可能失败
+   torch>=2.0.0
+   
+   # ✅ CPU 环境推荐
+   torch>=2.0.0  # Space 默认 CPU，无需指定 CUDA
+   ```
+
+2. **模型文件过大** - 使用 safetensors 格式
+3. **app.py 语法错误** - 本地先测试 `python app.py`
+
+---
+
+### 25. Space 模型推理 OOM
+
+**报错信息**:
+```
+CUDA out of memory / torch.cuda.OutOfMemoryError
+```
+
+**原因**: HuggingFace Spaces 免费版只有 CPU + 16GB RAM
+
+**解决方案**:
+```python
+# 强制 CPU 推理
+device = "cpu"
+model = AutoModelForCausalLM.from_pretrained(
+    model_id, 
+    device_map="cpu",
+    torch_dtype=torch.float32  # CPU 不支持 bf16
+)
+```
+
+---
+
+### 26. Gradio 接口无响应
+
+**现象**: 点击生成按钮后一直转圈
+
+**原因**: 生成参数导致无限循环或生成时间过长
+
+**解决方案**:
+```python
+# 限制生成长度和时间
+output = model.generate(
+    **inputs,
+    max_new_tokens=100,  # 限制长度
+    max_time=30.0,  # 限制时间
+    pad_token_id=tokenizer.pad_token_id,
+)
+```
+
+---
+
+## 📦 完整项目产出清单
+
+训练完成后应确保以下产物都已正确保存:
+
+### 本地文件
+- [ ] `training_log` - 完整训练日志
+- [ ] `generation_samples.log` - 生成样本历史
+- [ ] `trainer_state.json` - 训练状态 (包含 loss 曲线数据)
+- [ ] `final_model/` - 最终模型目录
+
+### HuggingFace Hub
+- [ ] 模型仓库创建成功
+- [ ] 模型可以用 `AutoModelForCausalLM.from_pretrained()` 加载
+- [ ] 模型可以用 `pipeline("text-generation")` 使用
+
+### HuggingFace Space
+- [ ] Space 状态为 "Running"
+- [ ] 界面可以正常交互
+- [ ] 生成结果符合预期
+
+### GitHub 仓库
+- [ ] README.md 包含真实训练数据
+- [ ] 训练脚本包含所有修复
+- [ ] 踩坑文档完整
+
+---
+
+## 🎯 项目经验总结
+
+### ✅ 成功经验
+
+1. **A100 优化组合**: Flash Attention 2 + TF32 + 8-bit AdamW 实现 3-4x 加速
+2. **生成样本日志**: 在训练中实时记录生成效果，便于分析语义成熟过程
+3. **增量检查点**: 保留多个 checkpoint 便于对比和恢复
+4. **SentencePiece + tokenizers 组合**: 解决 HuggingFace tokenizer 加载问题
+
+### ⚠️ 避坑要点
+
+1. **先测试后训练**: 小规模测试确保流程通顺后再开始完整训练
+2. **日志保存优先**: 不要只 print，一定要写入文件
+3. **版本锁定**: 记录成功运行时的依赖版本
+4. **本地备份**: 训练结束后立即下载重要文件，不要依赖服务器
+
+### 📊 最终训练数据
+
+| 指标 | 数值 |
+|------|------|
+| 模型参数量 | 82M |
+| 训练步数 | 11,838 |
+| 训练时间 | ~1.4 小时 |
+| 最终 Train Loss | 4.25 |
+| 最终 Eval Loss | 4.24 |
+| 数据量 | 200M tokens (Wiki + Zhihu) |
+| GPU | A100 40GB |
+
+---
+
+*完整更新: 2026-02-03*
